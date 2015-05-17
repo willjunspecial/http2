@@ -431,7 +431,7 @@ func (rp *requestParam) parseURL() (*url.URL, error) {
 		return &url.URL{Host: rp.authority}, nil
 	}
 	// TODO: handle asterisk '*' requests + test
-	return url.ParseRequestURI(rp.path)
+	return url.ParseRequestURI(rp.scheme + "://" + rp.authority + rp.path)
 }
 
 // stream represents a stream. This is the minimal metadata needed by

@@ -186,13 +186,21 @@ func ConfigureServer(s *http.Server, conf *Server) {
 		if testHookOnConn != nil {
 			testHookOnConn()
 		}
-		conf.handleConn(hs, c, h)
+		sc := conf.NewH2Conn(hs, c, h)
+		if sc != nil {
+			sc.Serve()
+		}
 	}
 	s.TLSNextProto[NextProtoTLS] = protoHandler
 	s.TLSNextProto["h2-14"] = protoHandler // temporary; see above.
 }
 
-func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
+// NewH2Conn creates a connection for h2 (HTTP/2 over TLS). Returns nil on
+// error.
+//
+// This must only be used to serve h2 over an already established TLS session.
+// For cleartext transports, see h2c.
+func (srv *Server) NewH2Conn(hs *http.Server, c net.Conn, h http.Handler) *serverConn {
 	sc := &serverConn{
 		srv:              srv,
 		hs:               hs,
@@ -240,7 +248,7 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 		// 5.4.1) of type INADEQUATE_SECURITY.
 		if sc.tlsState.Version < tls.VersionTLS12 {
 			sc.rejectConn(ErrCodeInadequateSecurity, "TLS version too low")
-			return
+			return nil
 		}
 
 		if sc.tlsState.ServerName == "" {
@@ -267,14 +275,15 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 			// "AllowInsecureWeakCiphers" option on the server later.
 			// Let's see how it plays out first.
 			sc.rejectConn(ErrCodeInadequateSecurity, fmt.Sprintf("Prohibited TLS 1.2 Cipher Suite: %x", sc.tlsState.CipherSuite))
-			return
+			return nil
 		}
 	}
 
 	if hook := testHookGetServerConn; hook != nil {
 		hook(sc)
 	}
-	sc.serve()
+
+	return sc
 }
 
 // isBadCipher reports whether the cipher is blacklisted by the HTTP/2 spec.
@@ -602,7 +611,8 @@ func (sc *serverConn) notePanic() {
 	}
 }
 
-func (sc *serverConn) serve() {
+// Serve starts the server loop for this connection.
+func (sc *serverConn) Serve() {
 	sc.serveG.check()
 	defer sc.notePanic()
 	defer sc.conn.Close()

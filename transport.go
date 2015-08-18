@@ -315,6 +315,34 @@ func (cc *clientConn) closeIfIdle() {
 	cc.tconn.Close()
 }
 
+type dataFrameWriter struct {
+	cc        *clientConn
+	cs        *clientStream
+	totalSize int64
+}
+
+func (dw dataFrameWriter) Write(p []byte) (n int, err error) {
+	size := len(p)
+	size64 := int64(size)
+	endStream := size64 >= dw.totalSize
+
+	if err = dw.cc.fr.WriteData(dw.cs.ID, endStream, p); err != nil {
+		dw.cc.werr = err
+		return 0, err
+	}
+
+	if endStream {
+		if err = dw.cc.bw.Flush(); err != nil {
+			dw.cc.werr = err
+			return 0, err
+		}
+	}
+
+	dw.totalSize -= size64
+
+	return size, err
+}
+
 func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cc.mu.Lock()
 
@@ -324,7 +352,7 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	cs := cc.newStream()
-	hasBody := false // TODO
+	hasBody := req.ContentLength > 0
 
 	// we send: HEADERS[+CONTINUATION] + (DATA?)
 	hdrs := cc.encodeHeaders(req)
@@ -353,8 +381,7 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cc.mu.Unlock()
 
 	if hasBody {
-		// TODO: write data. and it should probably be interleaved:
-		//   go ... io.Copy(dataFrameWriter{cc, cs, ...}, req.Body) ... etc
+		io.Copy(dataFrameWriter{cc, cs, req.ContentLength}, req.Body)
 	}
 
 	if werr != nil {

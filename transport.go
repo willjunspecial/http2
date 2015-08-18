@@ -115,13 +115,14 @@ func (t *Transport) RoundTrip(req *http.Request) (res *http.Response, err error)
 		}
 	}
 
-	for {
+	const maxRetryRequest int = 3
+	for i := 0; i < maxRetryRequest; i++ {
 		cc, err := t.getClientConn(host, port)
 		if err != nil {
 			return nil, err
 		}
 		res, err = cc.roundTrip(req)
-		if shouldRetryRequest(err) { // TODO: or clientconn is overloaded (too many outstanding requests)?
+		if shouldRetryRequest(err) && i < maxRetryRequest { // TODO: or clientconn is overloaded (too many outstanding requests)?
 			continue
 		}
 		if err != nil {
@@ -129,6 +130,7 @@ func (t *Transport) RoundTrip(req *http.Request) (res *http.Response, err error)
 		}
 		return res, nil
 	}
+	return nil, errors.New("http2: reach max retry request times=3")
 }
 
 // CloseIdleConnections closes any connections which were previously

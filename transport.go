@@ -384,8 +384,18 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 }
 
 func (cc *clientConn) writeHeader(name, value string) {
-	log.Printf("sending %q = %q", name, value)
+	cc.vlogf("sending %q = %q", name, value)
 	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+}
+
+func (cc *clientConn) vlogf(format string, args ...interface{}) {
+	if VerboseLogs {
+		cc.logf(format, args...)
+	}
+}
+
+func (cc *clientConn) logf(format string, args ...interface{}) {
+	log.Printf(format, args...)
 }
 
 type resAndError struct {
@@ -443,21 +453,21 @@ func (cc *clientConn) readLoop() {
 			cc.readerErr = err
 			return
 		}
-		log.Printf("Transport received %v: %#v", f.Header(), f)
+		cc.vlogf("Transport received %v: %#v", f.Header(), f)
 
 		streamID := f.Header().StreamID
 
 		_, isContinue := f.(*ContinuationFrame)
 		if isContinue {
 			if streamID != continueStreamID {
-				log.Printf("Protocol violation: got CONTINUATION with id %d; want %d", streamID, continueStreamID)
+				cc.vlogf("Protocol violation: got CONTINUATION with id %d; want %d", streamID, continueStreamID)
 				cc.readerErr = ConnectionError(ErrCodeProtocol)
 				return
 			}
 		} else if continueStreamID != 0 {
 			// Continue frames need to be adjacent in the stream
 			// and we were in the middle of headers.
-			log.Printf("Protocol violation: got %T for stream %d, want CONTINUATION for %d", f, streamID, continueStreamID)
+			cc.vlogf("Protocol violation: got %T for stream %d, want CONTINUATION for %d", f, streamID, continueStreamID)
 			cc.readerErr = ConnectionError(ErrCodeProtocol)
 			return
 		}
@@ -474,7 +484,7 @@ func (cc *clientConn) readLoop() {
 
 		cs := cc.streamByID(streamID, streamEnded)
 		if cs == nil {
-			log.Printf("Received frame for untracked stream ID %d", streamID)
+			cc.vlogf("Received frame for untracked stream ID %d", streamID)
 			continue
 		}
 
@@ -490,17 +500,17 @@ func (cc *clientConn) readLoop() {
 		case *ContinuationFrame:
 			cc.hdec.Write(f.HeaderBlockFragment())
 		case *DataFrame:
-			log.Printf("DATA: %q", f.Data())
+			cc.vlogf("DATA: %q", f.Data())
 			cs.pw.Write(f.Data())
 		case *GoAwayFrame:
 			cc.t.removeClientConn(cc)
 			if f.ErrCode != 0 {
 				// TODO: deal with GOAWAY more. particularly the error code
-				log.Printf("transport got GOAWAY with error code = %v", f.ErrCode)
+				cc.vlogf("transport got GOAWAY with error code = %v", f.ErrCode)
 			}
 			cc.setGoAway(f)
 		default:
-			log.Printf("Transport: unhandled response frame type %T", f)
+			cc.vlogf("Transport: unhandled response frame type %T", f)
 		}
 		headersEnded := false
 		if he, ok := f.(headersEnder); ok {
@@ -534,7 +544,7 @@ func (cc *clientConn) readLoop() {
 func (cc *clientConn) onNewHeaderField(f hpack.HeaderField) {
 	// TODO: verifiy pseudo headers come before non-pseudo headers
 	// TODO: verifiy the status is set
-	log.Printf("Header field: %+v", f)
+	cc.vlogf("Header field: %+v", f)
 	if f.Name == ":status" {
 		code, err := strconv.Atoi(f.Value)
 		if err != nil {

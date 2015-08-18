@@ -211,7 +211,7 @@ func (srv *Server) NewH2Conn(hs *http.Server, c net.Conn, h http.Handler) *serve
 		streams:          make(map[uint32]*stream),
 		readFrameCh:      make(chan frameAndGate),
 		readFrameErrCh:   make(chan error, 1), // must be buffered for 1
-		wantWriteFrameCh: make(chan frameWriteMsg, 8),
+		wantWriteFrameCh: make(chan frameWriteMsg, 64),
 		wroteFrameCh:     make(chan struct{}, 1), // buffered; one send in reading goroutine
 		bodyReadCh:       make(chan bodyReadMsg), // buffering doesn't matter either way
 		doneServing:      make(chan struct{}),
@@ -391,6 +391,33 @@ type requestParam struct {
 	scheme, authority string
 	sawRegularHeader  bool // saw a non-pseudo header already
 	invalidHeader     bool // an invalid header was seen
+}
+
+func (rp *requestParam) isValid() bool {
+	// 8.1.2.3 Request Pseudo-Header Fields
+	// All HTTP/2 requests MUST include exactly one valid
+	// value for the :method, :scheme, and :path pseudo-header fields,
+	// unless it is a CONNECT request (Section 8.3).
+	if rp.invalidHeader {
+		return false
+	}
+	if rp.method == "CONNECT" {
+		return rp.scheme == "" && (isHostPort(rp.path) || (rp.path == "" && isHostPort(rp.authority)))
+	}
+	return rp.method != "" && rp.path != "" && (rp.scheme == "https" || rp.scheme == "http")
+}
+
+func isHostPort(str string) bool {
+	_, _, err := net.SplitHostPort(str)
+	return err == nil
+}
+
+func (rp *requestParam) parseURL() (*url.URL, error) {
+	if rp.method == "CONNECT" {
+		return &url.URL{Host: rp.authority}, nil
+	}
+	// TODO: handle asterisk '*' requests + test
+	return url.ParseRequestURI(rp.path)
 }
 
 // stream represents a stream. This is the minimal metadata needed by
@@ -1364,18 +1391,15 @@ func (sc *serverConn) resetPendingRequest() {
 func (sc *serverConn) newWriterAndRequest() (*responseWriter, *http.Request, error) {
 	sc.serveG.check()
 	rp := &sc.req
-	if rp.invalidHeader || rp.method == "" || rp.path == "" ||
-		(rp.scheme != "https" && rp.scheme != "http") {
+	if VerboseLogs {
+		sc.vlogf("%T.requestParam=%#v\n", sc, rp)
+	}
+	if !rp.isValid() {
 		// See 8.1.2.6 Malformed Requests and Responses:
 		//
 		// Malformed requests or responses that are detected
 		// MUST be treated as a stream error (Section 5.4.2)
 		// of type PROTOCOL_ERROR."
-		//
-		// 8.1.2.3 Request Pseudo-Header Fields
-		// "All HTTP/2 requests MUST include exactly one valid
-		// value for the :method, :scheme, and :path
-		// pseudo-header fields"
 		return nil, nil, StreamError{rp.stream.id, ErrCodeProtocol}
 	}
 	var tlsState *tls.ConnectionState // nil if not scheme https
@@ -1396,8 +1420,7 @@ func (sc *serverConn) newWriterAndRequest() (*responseWriter, *http.Request, err
 		stream:        rp.stream,
 		needsContinue: needsContinue,
 	}
-	// TODO: handle asterisk '*' requests + test
-	url, err := url.ParseRequestURI(rp.path)
+	url, err := rp.parseURL()
 	if err != nil {
 		// TODO: find the right error code?
 		return nil, nil, StreamError{rp.stream.id, ErrCodeProtocol}
@@ -1693,6 +1716,61 @@ func (w *responseWriter) Flush() {
 		// final DATA frame (with END_STREAM) to be sent.
 		rws.writeChunk(nil)
 	}
+}
+
+type dataConn struct {
+	rws *responseWriterState
+}
+
+func (dc *dataConn) Read(p []byte) (int, error) {
+	return dc.rws.body.Read(p)
+}
+
+func (dc *dataConn) Write(p []byte) (int, error) {
+	switch dc.rws.stream.state {
+	case stateHalfClosedLocal, stateHalfClosedRemote, stateClosed:
+		return 0, StreamError{dc.rws.stream.id, ErrCodeStreamClosed}
+	}
+
+	curWrite := &dc.rws.curWrite
+	curWrite.streamID = dc.rws.stream.id
+	curWrite.p = p
+	curWrite.endStream = false
+	if err := dc.rws.conn.writeDataFromHandler(dc.rws.stream, curWrite, dc.rws.frameWriteCh); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (dc *dataConn) Close() error {
+	dc.rws.conn.resetStream(StreamError{dc.rws.stream.id, ErrCodeCancel})
+	return nil
+}
+
+func (dc *dataConn) LocalAddr() net.Addr {
+	return dc.rws.conn.conn.LocalAddr()
+}
+
+func (dc *dataConn) RemoteAddr() net.Addr {
+	return dc.rws.conn.conn.RemoteAddr()
+}
+
+func (dc *dataConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (dc *dataConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (dc *dataConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.Flush()
+	dc := &dataConn{w.rws}
+	return dc, bufio.NewReadWriter(bufio.NewReaderSize(dc, 0), bufio.NewWriterSize(dc, 0)), nil
 }
 
 func (w *responseWriter) CloseNotify() <-chan bool {

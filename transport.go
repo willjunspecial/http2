@@ -383,7 +383,7 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	cc.mu.Unlock()
 
 	if hasBody {
-		io.Copy(dataFrameWriter{cc, cs, req.ContentLength}, req.Body)
+		go io.Copy(dataFrameWriter{cc, cs, req.ContentLength}, req.Body)
 	}
 
 	if werr != nil {

@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/phuslu/http2/hpack"
 )
@@ -129,6 +130,44 @@ func (t *Transport) RoundTrip(req *http.Request) (res *http.Response, err error)
 			return nil, err
 		}
 		return res, nil
+	}
+	return nil, errors.New("http2: reach max retry request times=3")
+}
+
+func (t *Transport) Connect(req *http.Request) (conn net.Conn, err error) {
+	var host, port string
+	if t.Proxy == nil {
+		host, port, err = net.SplitHostPort(req.URL.Host)
+		if err != nil {
+			host = req.URL.Host
+			port = "443"
+		}
+	} else {
+		u, err := t.Proxy(req)
+		if err != nil {
+			return nil, err
+		}
+		host, port, err = net.SplitHostPort(u.Host)
+		if err != nil {
+			host = u.Host
+			port = "443"
+		}
+	}
+
+	const maxRetryRequest int = 3
+	for i := 0; i < maxRetryRequest; i++ {
+		cc, err := t.getClientConn(host, port)
+		if err != nil {
+			return nil, err
+		}
+		conn, err = cc.connect(req)
+		if shouldRetryRequest(err) && i < maxRetryRequest { // TODO: or clientconn is overloaded (too many outstanding requests)?
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
 	}
 	return nil, errors.New("http2: reach max retry request times=3")
 }
@@ -345,16 +384,16 @@ func (dw dataFrameWriter) Write(p []byte) (n int, err error) {
 	return size, err
 }
 
-func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
+func (cc *clientConn) do(req *http.Request) resAndError {
 	cc.mu.Lock()
 
 	if cc.closed {
 		cc.mu.Unlock()
-		return nil, errClientConnClosed
+		return resAndError{err: errClientConnClosed}
 	}
 
 	cs := cc.newStream()
-	hasBody := req.ContentLength > 0
+	hasBody := req.ContentLength > 0 || req.Method == "CONNECT"
 
 	// we send: HEADERS[+CONTINUATION] + (DATA?)
 	hdrs := cc.encodeHeaders(req)
@@ -387,10 +426,14 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	if werr != nil {
-		return nil, werr
+		return resAndError{err: werr}
 	}
 
-	re := <-cs.resc
+	return <-cs.resc
+}
+
+func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
+	re := cc.do(req)
 	if re.err != nil {
 		return nil, re.err
 	}
@@ -398,6 +441,67 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	res.Request = req
 	res.TLS = cc.tlsState
 	return res, nil
+}
+
+type clientDataConn struct {
+	re *resAndError
+}
+
+func (dc *clientDataConn) Read(p []byte) (int, error) {
+	return dc.re.res.Body.Read(p)
+}
+
+func (dc *clientDataConn) Write(p []byte) (int, error) {
+	if err := dc.re.cc.fr.WriteData(dc.re.cs.ID, false, p); err != nil {
+		dc.re.cc.werr = err
+		return 0, err
+	}
+	if err := dc.re.cc.bw.Flush(); err != nil {
+		dc.re.cc.werr = err
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (dc *clientDataConn) Close() (err error) {
+	err = dc.re.cc.fr.WriteRSTStream(dc.re.cs.ID, ErrCodeStreamClosed)
+	dc.re.cc.werr = err
+	if cs, ok := dc.re.cc.streams[dc.re.cs.ID]; ok {
+		delete(dc.re.cc.streams, dc.re.cs.ID)
+		if p := cs.pr; p != nil {
+			p.CloseWithError(io.EOF)
+		}
+		cs.pw.Close()
+	}
+	return err
+}
+
+func (dc *clientDataConn) LocalAddr() net.Addr {
+	return dc.re.cc.tconn.LocalAddr()
+}
+
+func (dc *clientDataConn) RemoteAddr() net.Addr {
+	return dc.re.cc.tconn.RemoteAddr()
+}
+
+func (dc *clientDataConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (dc *clientDataConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (dc *clientDataConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+func (cc *clientConn) connect(req *http.Request) (net.Conn, error) {
+	re := cc.do(req)
+	if re.err != nil {
+		return nil, re.err
+	}
+	return &clientDataConn{&re}, nil
 }
 
 // requires cc.mu be held.
@@ -450,6 +554,8 @@ func (cc *clientConn) logf(format string, args ...interface{}) {
 type resAndError struct {
 	res *http.Response
 	err error
+	cc  *clientConn
+	cs  *clientStream
 }
 
 // requires cc.mu be held.
@@ -585,7 +691,7 @@ func (cc *clientConn) readLoop() {
 			cc.nextRes.Body = cs.pr
 			res := cc.nextRes
 			activeRes[streamID] = cs
-			cs.resc <- resAndError{res: res}
+			cs.resc <- resAndError{res: res, cc: cc, cs: cs}
 		}
 	}
 }

@@ -412,12 +412,24 @@ func isHostPort(str string) bool {
 	return err == nil
 }
 
-func (rp *requestParam) parseURL() (*url.URL, error) {
+func (rp *requestParam) parseURL() (u *url.URL, err error) {
 	if rp.method == "CONNECT" {
-		return &url.URL{Host: rp.authority}, nil
+		return &url.URL{
+			Host:   rp.authority,
+			Scheme: rp.scheme,
+			Path:   rp.path,
+		}, nil
+
 	}
 	// TODO: handle asterisk '*' requests + test
-	return url.ParseRequestURI(rp.path)
+	u, err = url.ParseRequestURI(rp.path)
+	if u.Scheme == "" {
+		u.Scheme = rp.scheme
+	}
+	if u.Host == "" {
+		u.Host = rp.authority
+	}
+	return
 }
 
 // stream represents a stream. This is the minimal metadata needed by

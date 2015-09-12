@@ -438,6 +438,9 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 		return nil, re.err
 	}
 	res := re.res
+	if cl, ok := cc.nextRes.Header["Content-Length"]; ok && cl[0] != "0" {
+		res.ContentLength, _ = strconv.ParseInt(cl[0], 10, 64)
+	}
 	res.Request = req
 	res.TLS = cc.tlsState
 	return res, nil
